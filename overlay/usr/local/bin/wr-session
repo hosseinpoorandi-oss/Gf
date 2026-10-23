@@ -1,0 +1,5 @@
+#!/bin/sh
+xsetroot -solid '#0b1220'
+xset s off -dpms
+openbox &
+exec python3 /usr/local/lib/winrescue/ui.py

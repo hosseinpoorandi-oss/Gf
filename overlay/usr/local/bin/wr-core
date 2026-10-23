@@ -1,0 +1,149 @@
+#!/usr/bin/env bash
+# WinRescue backend. Output lines start with a tag: INFO OK WARN FAIL ABNORMAL
+set -u
+MNT=/mnt/winrescue; ESPM=/mnt/winrescue-esp
+say(){ printf '%s\n' "$*"; }
+hum(){ numfmt --to=iec "${1:-0}"; }
+
+live_disk(){ local s; s=$(findmnt -no SOURCE /run/live/medium 2>/dev/null) || return 0
+  [ -n "$s" ] && lsblk -no PKNAME "$s" 2>/dev/null | head -n1; return 0; }
+
+find_win(){ local p t
+  for p in $(lsblk -lnpo NAME,FSTYPE | awk '$2=="ntfs"{print $1}'); do
+    t=$(mktemp -d)
+    if mount -t ntfs-3g -o ro "$p" "$t" 2>/dev/null; then
+      if [ -d "$t/Windows/System32/config" ]; then umount "$t"; rmdir "$t"; echo "$p"; return 0; fi
+      umount "$t"
+    fi
+    rmdir "$t"
+  done; return 1; }
+
+disks(){ local live wd="" w line
+  live=$(live_disk)
+  if w=$(find_win); then wd=$(lsblk -no PKNAME "$w" | head -n1); fi
+  while read -r line; do
+    eval "$line"
+    [ "$TYPE" = disk ] || continue
+    case $NAME in zram*|ram*|loop*|sr*) continue;; esac
+    [ "$NAME" = "$live" ] && continue
+    printf '%s\t%s\t%s\t%s\n' "$NAME" "$SIZE" "${MODEL:-Unknown}" "$([ "$NAME" = "$wd" ] && echo windows || echo -)"
+  done < <(lsblk -dn -P -o NAME,SIZE,MODEL,TYPE)
+}
+
+umount_all(){ umount "$ESPM" 2>/dev/null; umount "$MNT" 2>/dev/null; sync; }
+
+wipe(){ local n=${1:-} d sec left p
+  [[ $n =~ ^[a-zA-Z0-9]+$ ]] || { say "FAIL Invalid disk name"; return 1; }
+  d=/dev/$n; [ -b "$d" ] || { say "FAIL $d not found"; return 1; }
+  [ "$n" = "$(live_disk)" ] && { say "FAIL Refusing: that is the USB drive you booted from"; return 1; }
+  say "INFO Unmounting $d"; umount_all
+  for p in $(lsblk -lnpo NAME "$d"); do umount -f "$p" 2>/dev/null; swapoff "$p" 2>/dev/null; done
+  say "INFO Removing filesystem signatures (C:, EFI, MSR, Recovery)"
+  for p in $(lsblk -lnpo NAME "$d" | tail -n +2); do wipefs -af "$p" >/dev/null 2>&1; done
+  say "INFO Destroying GPT/MBR partition tables"
+  sgdisk --zap-all "$d" >/dev/null 2>&1; wipefs -af "$d" >/dev/null 2>&1
+  sec=$(blockdev --getsz "$d")
+  dd if=/dev/zero of="$d" bs=1M count=16 conv=fsync status=none
+  [ "$sec" -gt 65536 ] && dd if=/dev/zero of="$d" bs=512 seek=$((sec-32768)) count=32768 conv=fsync status=none
+  sync; blockdev --rereadpt "$d" 2>/dev/null; partprobe "$d" 2>/dev/null; udevadm settle
+  left=$(lsblk -lnpo NAME "$d" | tail -n +2 | wc -l)
+  if [ "$left" -eq 0 ]; then say "OK $d is now completely unallocated"; else say "FAIL $left partition(s) still visible"; return 1; fi
+}
+
+mount_win(){
+  mountpoint -q "$MNT" && return 0
+  WP=$(find_win) || { say "FAIL No Windows installation found on any disk"; return 1; }
+  say "INFO Windows volume: $WP"
+  ntfsfix -d "$WP" 2>&1 | sed 's/^/INFO /'
+  mkdir -p "$MNT"
+  mount -t ntfs-3g -o rw,remove_hiberfile "$WP" "$MNT" 2>&1 | sed 's/^/INFO /'
+  mountpoint -q "$MNT" || { say "FAIL Could not mount the Windows volume read-write"; return 1; }
+}
+
+build_junk(){ shopt -s nullglob
+  JUNK=("$MNT/Windows/Temp" "$MNT/Windows/SoftwareDistribution/Download" "$MNT/Windows/Minidump"
+        "$MNT/Windows/MEMORY.DMP" "$MNT/Windows/Logs/CBS" "$MNT/ProgramData/Microsoft/Windows/WER"
+        "$MNT"/Users/*/AppData/Local/Temp "$MNT"/Users/*/AppData/Local/CrashDumps); }
+
+repair(){ local W S C f h b n=0 miss=0 Q d esp B p total used pct junk
+  mount_win || return 1
+  W=$MNT/Windows; S=$W/System32; C=$S/config
+  say "INFO Checking core system files"
+  for f in ntoskrnl.exe ntdll.dll kernel32.dll smss.exe winlogon.exe config/SYSTEM config/SOFTWARE; do
+    [ -s "$S/$f" ] || { say "FAIL Missing or empty: System32/$f"; miss=$((miss+1)); }
+  done
+  { [ -s "$S/winload.efi" ] || [ -s "$S/winload.exe" ]; } || { say "FAIL Missing winload"; miss=$((miss+1)); }
+  [ $miss -eq 0 ] && say "OK Core system files present"
+
+  say "INFO Checking registry hives"
+  for h in SYSTEM SOFTWARE SAM SECURITY DEFAULT; do
+    f=$C/$h
+    if echo ls | hivexsh "$f" >/dev/null 2>&1; then say "OK Registry hive $h"
+    else say "FAIL Registry hive $h is corrupt or missing"; b=$C/RegBack/$h
+      if [ -s "$b" ] && echo ls | hivexsh "$b" >/dev/null 2>&1; then
+        { [ -e "$f" ] && mv "$f" "$f.wr-bad"; cp "$b" "$f"; } && say "OK Restored $h from RegBack"
+      else say "WARN No valid RegBack copy of $h"; fi
+    fi
+  done
+
+  say "INFO Looking for broken (zero-byte) system binaries"
+  Q=$W/WinRescue-Quarantine
+  while IFS= read -r -d '' f; do mkdir -p "$Q"; mv "$f" "$Q/$(basename "$f").$n.bad" && n=$((n+1))
+  done < <(find "$S" -maxdepth 2 -type f \( -iname '*.dll' -o -iname '*.exe' -o -iname '*.sys' \) -size 0 -print0 2>/dev/null)
+  say "OK Quarantined $n broken file(s) (moved to Windows/WinRescue-Quarantine, not deleted)"
+
+  p=$W/WinSxS/pending.xml
+  [ -f "$p" ] && mv "$p" "$p.wr-bak" && say "OK Cleared stuck pending-update state (pending.xml)"
+
+  d=$(lsblk -no PKNAME "$WP" | head -n1)
+  esp=$(lsblk -lnpo NAME,PARTTYPE "/dev/$d" | awk 'tolower($2)=="c12a7328-f81f-11d2-ba4b-00a0c93ec93b"{print $1; exit}')
+  if [ -n "$esp" ]; then
+    mkdir -p "$ESPM"
+    if mount -t vfat "$esp" "$ESPM" 2>/dev/null; then
+      B=$ESPM/EFI/Microsoft/Boot
+      if [ -s "$B/bootmgfw.efi" ]; then say "OK EFI boot manager present"
+      elif [ -s "$W/Boot/EFI/bootmgfw.efi" ]; then mkdir -p "$B" && cp "$W/Boot/EFI/bootmgfw.efi" "$B/" && say "OK Restored bootmgfw.efi to EFI partition"
+      else say "FAIL EFI boot manager missing and no copy available"; fi
+      if [ -s "$B/BCD" ]; then say "OK Boot configuration (BCD) present"
+      else say "WARN BCD missing - rebuild from Windows Recovery with: bootrec /rebuildbcd"; fi
+    else say "WARN Could not mount EFI partition"; fi
+  else say "INFO No EFI partition (legacy/MBR layout) - boot files not checked"; fi
+
+  build_junk
+  read -r total used < <(df -B1 --output=size,used "$MNT" | tail -n1)
+  pct=$((used*100/total))
+  junk=$(du -sb "${JUNK[@]}" 2>/dev/null | awk '{s+=$1} END{print s+0}')
+  say "INFO C: drive is ${pct}% full ($(hum $used) of $(hum $total)); reclaimable temp/cache/dump files: $(hum $junk)"
+  [ -d "$MNT/Windows.old" ] && say "INFO Windows.old exists ($(hum "$(du -sb "$MNT/Windows.old" 2>/dev/null | cut -f1)")) - left untouched"
+  if [ "$pct" -ge 90 ] || [ "$junk" -ge 5368709120 ]; then say "ABNORMAL C drive size looks abnormal"; fi
+  [ $miss -gt 0 ] && say "WARN Missing core files cannot be rebuilt from Linux. If Windows still fails, use Reset/Reinstall."
+  umount_all; say "OK Scan and repair finished"; return 0
+}
+
+clean(){ local p before after
+  mount_win || return 1
+  build_junk; before=$(df -B1 --output=used "$MNT" | tail -n1)
+  for p in "${JUNK[@]}"; do [ -e "$p" ] || continue
+    if [ -d "$p" ]; then find "$p" -mindepth 1 -delete 2>/dev/null; else rm -f "$p"; fi
+    say "OK Cleaned ${p#$MNT}"
+  done
+  sync; after=$(df -B1 --output=used "$MNT" | tail -n1)
+  say "OK Freed $(hum $((before-after)))"; umount_all
+}
+
+finish(){ local id
+  umount_all
+  if [ -d /sys/firmware/efi ]; then
+    id=$(efibootmgr 2>/dev/null | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\)\*\? Windows Boot Manager.*/\1/p' | head -n1)
+    [ -n "$id" ] && efibootmgr -n "$id" >/dev/null 2>&1
+  fi
+  systemctl reboot
+}
+
+reboot_fw(){ sync; if [ -d /sys/firmware/efi ]; then systemctl reboot --firmware-setup; else systemctl reboot; fi; }
+
+case "${1:-}" in
+  disks) disks;; wipe) wipe "${2:-}";; repair) repair;; clean) clean;;
+  finish) finish;; reboot-fw) reboot_fw;;
+  *) echo "usage: wr-core disks|wipe <disk>|repair|clean|finish|reboot-fw"; exit 2;;
+esac

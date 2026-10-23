@@ -1,0 +1,28 @@
+#!/bin/bash
+# Starts the GUI with progressively safer Xorg setups; if all fail, starts the text UI.
+CONF=/etc/X11/xorg.conf.d/10-wr-driver.conf
+mkdir -p /etc/X11/xorg.conf.d /run/wr
+cmdline=$(cat /proc/cmdline)
+case "$cmdline" in *wr.mode=text*) exec /usr/local/bin/wr-tui;; esac
+case "$cmdline" in *wr.mode=safe*) order="fbdev vesa";; *) order="auto fbdev vesa";; esac
+
+for drv in $order; do
+  if [ "$drv" = auto ]; then
+    rm -f "$CONF"
+  else
+    cat > "$CONF" <<EOF
+Section "ServerFlags"
+    Option "AutoAddGPU" "false"
+EndSection
+Section "Device"
+    Identifier "wr-fallback"
+    Driver "$drv"
+EndSection
+EOF
+  fi
+  start=$SECONDS
+  xinit /usr/local/bin/wr-session -- /usr/bin/X :0 vt1 -nolisten tcp > "/run/wr/x-$drv.log" 2>&1
+  # GUI ran for a while then ended: restart the whole chain. Quick exit = failure: try next driver.
+  [ $((SECONDS - start)) -ge 10 ] && exec "$0"
+done
+exec /usr/local/bin/wr-tui

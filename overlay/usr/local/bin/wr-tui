@@ -1,0 +1,22 @@
+#!/bin/bash
+# Text-mode WinRescue (used when no graphical driver works, or in "Text mode only").
+C=/usr/local/bin/wr-core
+export TERM=linux
+while :; do
+  ch=$(whiptail --title "WinRescue (text mode)" --menu "Choose an action" 15 70 3 \
+        1 "Full Windows Wipe" 2 "Smart Windows Repair" 3 "Open a shell" 3>&1 1>&2 2>&3) || continue
+  case $ch in
+  1) items=()
+     while IFS=$'\t' read -r n s m w; do items+=("$n" "$s $m $([ "$w" = windows ] && echo '[Windows]')"); done < <($C disks)
+     [ ${#items[@]} -eq 0 ] && { whiptail --msgbox "No disks found." 8 40; continue; }
+     d=$(whiptail --menu "Disk to ERASE completely" 18 74 8 "${items[@]}" 3>&1 1>&2 2>&3) || continue
+     t=$(whiptail --inputbox "ALL data on /dev/$d will be destroyed. Type WIPE to confirm:" 10 64 3>&1 1>&2 2>&3) || continue
+     [ "$t" = WIPE ] || { whiptail --msgbox "Cancelled." 8 30; continue; }
+     if $C wipe "$d"; then echo "Rebooting to firmware setup in 5s..."; sleep 5; $C reboot-fw
+     else read -rp "Wipe failed. Press Enter to continue." _; fi;;
+  2) $C repair | tee /tmp/repair.log
+     if grep -q '^ABNORMAL' /tmp/repair.log && whiptail --yesno "Your C drive size looks abnormal. Do you want to remove unnecessary files? (Yes / No)" 10 64; then $C clean; fi
+     whiptail --msgbox "Remove the USB drive, then press OK to reboot into Windows." 9 62; $C finish;;
+  3) bash;;
+  esac
+done

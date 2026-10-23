@@ -1,0 +1,17 @@
+[Unit]
+Description=WinRescue UI
+After=systemd-user-sessions.service systemd-udev-settle.service
+Conflicts=getty@tty1.service
+
+[Service]
+Environment=HOME=/root NO_AT_BRIDGE=1
+ExecStart=/usr/local/bin/wr-launch
+StandardInput=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
